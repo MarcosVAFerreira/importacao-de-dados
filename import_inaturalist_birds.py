@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 Importador de Aves -> Obsidian Markdown (YAML frontmatter)
-Usa: eBird Taxonomy + iNaturalist API (observações) para obter imagem
+Usa: eBird Taxonomy + iNaturalist API + Wikipedia (fallback) para obter imagem
 Gera um arquivo por espécie com campo coverUrl apontando a imagem (quando encontrada)
+Suporta retomar de onde parou e evita duplicatas.
 """
 
 import os
@@ -10,9 +11,11 @@ import time
 import requests
 import yaml
 import sys
+import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --------------------------------------------------------
-# CONFIG (Windows + Pasta)
+# CONFIG
 # --------------------------------------------------------
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -23,13 +26,15 @@ except:
 OUTPUT_DIR = r"C:\Users\Usuario\Documents\Gnosis\3- Bem estar\Hobbies e Inspirações\Coleções\Animals (Non Fiction)\Birds"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+CHECKPOINT_FILE = os.path.join(OUTPUT_DIR, "checkpoint.json")
+MAX_WORKERS = 10  # número de threads para download paralelo
+
 session = requests.Session()
 session.headers.update({"User-Agent": "BirdImporter/1.0 (via iNaturalist)"})
 
 # --------------------------------------------------------
 # UTILIDADES
 # --------------------------------------------------------
-
 def get_json(url, params=None):
     r = session.get(url, params=params, timeout=30)
     r.raise_for_status()
@@ -49,14 +54,9 @@ def write_md(filename, yaml_obj, body_md=""):
         f.write(body_md)
 
 # --------------------------------------------------------
-# iNaturalist: buscar uma observação para o táxon
+# iNaturalist: pegar imagem
 # --------------------------------------------------------
-
 def get_inat_image_url_by_taxon(scientific_name, per_page=1):
-    """
-    Tenta buscar observações no iNaturalist para a espécie (nome científico).
-    Retorna a URL da primeira foto da primeira observação encontrada, ou None.
-    """
     try:
         resp = get_json(
             "https://api.inaturalist.org/v1/observations",
@@ -74,23 +74,41 @@ def get_inat_image_url_by_taxon(scientific_name, per_page=1):
         photos = obs.get("photos", [])
         if not photos:
             return None
-        # cada photo tem 'url' base — pode haver diferentes tamanhos
-        # usar a URL “original_size” se disponível, senão “medium_url” ou “url”
         first_photo = photos[0]
-        # iNaturalist API v1 costuma retornar 'url', 'medium_url' etc.
         for key in ("url", "medium_url", "original_url", "large_url"):
             if key in first_photo and first_photo[key]:
                 return first_photo[key]
-        # fallback: se só houver 'url'
         return first_photo.get("url")
-    except Exception as e:
-        # print("Erro ao buscar iNaturalist:", e)
+    except Exception:
+        return None
+
+# --------------------------------------------------------
+# Wikipedia: pegar imagem principal
+# --------------------------------------------------------
+def get_wikipedia_image(scientific_name):
+    try:
+        # pegar artigo em inglês (melhor cobertura)
+        url = "https://en.wikipedia.org/w/api.php"
+        params = {
+            "action": "query",
+            "format": "json",
+            "titles": scientific_name,
+            "prop": "pageimages",
+            "pithumbsize": 800
+        }
+        data = get_json(url, params=params)
+        pages = data.get("query", {}).get("pages", {})
+        for page in pages.values():
+            thumb = page.get("thumbnail", {}).get("source")
+            if thumb:
+                return thumb
+        return None
+    except Exception:
         return None
 
 # --------------------------------------------------------
 # EBIRD TAXONOMY
 # --------------------------------------------------------
-
 def load_ebird_taxonomy():
     print("[INFO] Baixando taxonomia eBird (pode demorar)...")
     url = "https://api.ebird.org/v2/ref/taxonomy/ebird?fmt=json"
@@ -99,53 +117,80 @@ def load_ebird_taxonomy():
     return data
 
 # --------------------------------------------------------
-# PROGRAMA PRINCIPAL
+# Função principal de processamento de cada pássaro
 # --------------------------------------------------------
+def process_bird(bird, processed_set):
+    sci_name = bird.get("sciName", "").strip()
+    com_name_en = bird.get("comName", "").strip()
+    family = bird.get("familyComName", "").strip()
+    order = bird.get("order", "").strip()
+    species_code = bird.get("speciesCode", "").strip()
+    com_name_pt = bird.get("comNamePt", "").strip()
 
+    if species_code in processed_set:
+        print(f"[SKIP] {com_name_en} — já processado")
+        return species_code
+
+    # buscar imagem: primeiro iNaturalist, depois Wikipedia
+    cover_url = get_inat_image_url_by_taxon(sci_name)
+    if not cover_url:
+        cover_url = get_wikipedia_image(sci_name)
+
+    yaml_obj = {
+        "type": "animals",
+        "subType": "bird",
+        "id": species_code,
+        "name_en": com_name_en,
+        "name_pt": com_name_pt,
+        "scientific_name": sci_name,
+        "taxonomy": {
+            "order": order,
+            "family": family,
+        },
+        "coverUrl": cover_url,
+        "image": cover_url,
+    }
+
+    fname = safe_filename(f"{com_name_en}.md")
+    md_body = f"# {com_name_en}\n\n"
+    if com_name_pt:
+        md_body += f"**Nome em PT-BR:** {com_name_pt}\n\n"
+    md_body += f"**Nome científico:** *{sci_name}*\n\n"
+    md_body += f"**Família:** {family}\n\n"
+    md_body += f"**Ordem:** {order}\n\n"
+    if cover_url:
+        md_body += f"![image]({cover_url})\n"
+
+    write_md(fname, yaml_obj, md_body)
+    print(f"[OK] {com_name_en} — cover: {bool(cover_url)}")
+    return species_code
+
+# --------------------------------------------------------
+# Main
+# --------------------------------------------------------
 def main():
     birds = load_ebird_taxonomy()
 
-    for b in birds:
-        sci_name = b.get("sciName", "").strip()
-        com_name_en = b.get("comName", "").strip()
-        family = b.get("familyComName", "").strip()
-        order = b.get("order", "").strip()
-        species_code = b.get("speciesCode", "").strip()
-        com_name_pt = b.get("comNamePt", "").strip()
+    # carregar checkpoint
+    if os.path.exists(CHECKPOINT_FILE):
+        with open(CHECKPOINT_FILE, "r", encoding="utf-8") as f:
+            processed = set(json.load(f))
+    else:
+        processed = set()
 
-        # Buscar imagem no iNaturalist
-        cover_url = get_inat_image_url_by_taxon(sci_name)
-        time.sleep(0.2)  # para evitar limite de requisições
+    total = len(birds)
+    print(f"[INFO] Começando importação — {len(processed)} já processados.")
 
-        yaml_obj = {
-            "type": "animals",
-            "subType": "bird",
-            "id": species_code,
-            "name_en": com_name_en,
-            "name_pt": com_name_pt,
-            "scientific_name": sci_name,
-            "taxonomy": {
-                "order": order,
-                "family": family,
-            },
-            "coverUrl": cover_url,
-            "image": cover_url,
-        }
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_species = {executor.submit(process_bird, b, processed): b for b in birds}
 
-        # Nome do arquivo com nome legível da espécie
-        fname = safe_filename(f"{com_name_en}.md")
-
-        md_body = f"# {com_name_en}\n\n"
-        if com_name_pt:
-            md_body += f"**Nome em PT-BR:** {com_name_pt}\n\n"
-        md_body += f"**Nome científico:** *{sci_name}*\n\n"
-        md_body += f"**Família:** {family}\n\n"
-        md_body += f"**Ordem:** {order}\n\n"
-        if cover_url:
-            md_body += f"![image]({cover_url})\n"
-
-        write_md(fname, yaml_obj, md_body)
-        print(f"[OK] {com_name_en} — cover: {bool(cover_url)}")
+        for future in as_completed(future_to_species):
+            species_code = future.result()
+            if species_code:
+                processed.add(species_code)
+                # salvar checkpoint incremental
+                with open(CHECKPOINT_FILE, "w", encoding="utf-8") as f:
+                    json.dump(list(processed), f, ensure_ascii=False, indent=2)
 
     print("\n=== IMPORTAÇÃO DE AVES FINALIZADA ===")
 
